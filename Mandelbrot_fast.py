@@ -1,6 +1,6 @@
 """
 Fast Mandelbrot Set Renderer using Numba and NumPy
-Author: hotwell drinker(in discord)
+Author: hotwell drinker (in discord), icannotcodeijuststartmynewaccount(github)
 License: MIT
 """
 
