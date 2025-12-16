@@ -1,108 +1,134 @@
 """
-Tile-Based Mandelbrot Renderer for Termux
-Memory-efficient with progress tracking
+Mandelbrot Termux Edition
+Auto-detects environment and uses appropriate backend.
 """
+
+import sys
+import os
+
+# Detect if running on Termux
+def is_termux():
+    """Check if running in Termux environment."""
+    return 'com.termux' in os.environ.get('PREFIX', '')
+
+# Try to import Numba, fallback if not available
+HAS_NUMBA = False
+if not is_termux():
+    try:
+        from numba import jit, prange
+        HAS_NUMBA = True
+        print("✅ Numba available - using accelerated backend")
+    except ImportError:
+        print("⚠️  Numba not found - using NumPy backend")
+else:
+    print("📱 Termux detected - using optimized NumPy backend")
+
+# Import other dependencies
 import numpy as np
 from PIL import Image
 import time
-import os
 from tqdm import tqdm
 
 
-def mandelbrot_tile(c_real, c_imag, max_iter):
-    """
-    Process a single tile (optimized for small arrays).
-    """
-    height, width = c_real.shape
-    divtime = np.zeros((height, width), dtype=np.int32)
-    
-    # Local variables for speed
-    threshold = 4.0
-    
-    for i in range(height):
-        for j in range(width):
-            cr = c_real[i, j]
-            ci = c_imag[i, j]
-            zr = zi = 0.0
+# Conditional function definition
+if HAS_NUMBA:
+    @jit(nopython=True, parallel=True, fastmath=True, cache=True)
+    def mandelbrot_kernel(c_real, c_imag, max_iter, progress_counter=None):
+        """Numba-accelerated kernel (not available on Termux)."""
+        height, width = c_real.shape
+        divtime = np.zeros((height, width), dtype=np.int32)
+        
+        for i in prange(height):
+            for j in range(width):
+                cr = c_real[i, j]
+                ci = c_imag[i, j]
+                zr, zi = 0.0, 0.0
+                
+                for k in range(max_iter):
+                    zr2 = zr * zr
+                    zi2 = zi * zi
+                    if zr2 + zi2 > 4.0:
+                        divtime[i, j] = k
+                        break
+                    zi = 2.0 * zr * zi + ci
+                    zr = zr2 - zi2 + cr
+                else:
+                    divtime[i, j] = max_iter - 1
+        
+        return divtime
+else:
+    def mandelbrot_kernel(c_real, c_imag, max_iter, progress_counter=None):
+        """NumPy-based kernel (works everywhere, including Termux)."""
+        height, width = c_real.shape
+        divtime = np.zeros((height, width), dtype=np.int32)
+        threshold = 4.0
+        
+        # Tiled processing for memory efficiency
+        tile_size = min(256, height)  # Smaller tiles for Termux
+        
+        for ty in range(0, height, tile_size):
+            tile_end = min(ty + tile_size, height)
+            tile_height = tile_end - ty
             
-            # Optimized escape loop
-            for k in range(max_iter):
-                zr2 = zr * zr
-                zi2 = zi * zi
-                if zr2 + zi2 > threshold:
-                    divtime[i, j] = k
-                    break
-                zi = 2.0 * zr * zi + ci
-                zr = zr2 - zi2 + cr
-            else:
-                divtime[i, j] = max_iter - 1
-    
-    return divtime
+            for tx in range(0, width, tile_size):
+                tile_end_x = min(tx + tile_size, width)
+                tile_width = tile_end_x - tx
+                
+                # Process tile
+                c_real_tile = c_real[ty:tile_end, tx:tile_end_x]
+                c_imag_tile = c_imag[ty:tile_end, tx:tile_end_x]
+                
+                z_real = np.zeros_like(c_real_tile, dtype=np.float64)
+                z_imag = np.zeros_like(c_imag_tile, dtype=np.float64)
+                tile_result = np.zeros((tile_height, tile_width), dtype=np.int32)
+                mask = np.ones((tile_height, tile_width), dtype=bool)
+                
+                for k in range(max_iter):
+                    if not np.any(mask):
+                        break
+                    
+                    zr2 = z_real[mask] * z_real[mask]
+                    zi2 = z_imag[mask] * z_imag[mask]
+                    
+                    z_imag[mask] = 2.0 * z_real[mask] * z_imag[mask] + c_imag_tile[mask]
+                    z_real[mask] = zr2 - zi2 + c_real_tile[mask]
+                    
+                    diverged = (zr2 + zi2) > threshold
+                    if np.any(diverged):
+                        div_indices = np.where(mask)
+                        tile_result[div_indices[0][diverged], div_indices[1][diverged]] = k
+                        mask[div_indices[0][diverged], div_indices[1][diverged]] = False
+                
+                tile_result[mask] = max_iter - 1
+                divtime[ty:tile_end, tx:tile_end_x] = tile_result
+        
+        return divtime
 
 
-def render_mandelbrot_tiled(width=1280, height=720, max_iter=8192,
-                           x_min=-0.178, x_max=-0.148,
-                           y_min=-1.0409375, y_max=-1.0240625,
-                           tile_size=256):
-    """
-    Render using tiles to manage memory on Termux.
-    """
-    print(f"Rendering {width}x{height} with {max_iter} iterations...")
-    print(f"Tile size: {tile_size}x{tile_size}")
+def render_mandelbrot(width=1280, height=720, max_iter=4096,
+                      x_min=-2.0, x_max=0.5, y_min=-1.25, y_max=1.25):
+    """Main render function - auto-selects best backend."""
     
-    # Pre-calculate scales
-    x_scale = (x_max - x_min) / width
-    y_scale = (y_max - y_min) / height
+    print(f"{'='*60}")
+    print(f"MANDELBROT RENDERER")
+    print(f"{'='*60}")
+    print(f"Backend: {'Numba' if HAS_NUMBA else 'NumPy (Termux Optimized)'}")
+    print(f"Resolution: {width}x{height}")
+    print(f"Iterations: {max_iter}")
+    print(f"{'='*60}")
     
-    # Create output array
-    result = np.zeros((height, width), dtype=np.int32)
+    # Create coordinate grid
+    x = np.linspace(x_min, x_max, width, dtype=np.float64)
+    y = np.linspace(y_min, y_max, height, dtype=np.float64)
+    X, Y = np.meshgrid(x, y)
     
-    # Calculate tile grid
-    tiles_x = (width + tile_size - 1) // tile_size
-    tiles_y = (height + tile_size - 1) // tile_size
-    total_tiles = tiles_x * tiles_y
-    
-    print(f"Processing {total_tiles} tiles...")
-    
-    # Progress bar
-    pbar = tqdm(total=total_tiles, desc="Tiles", unit="tile")
-    
+    # Render with timing
     start_time = time.time()
-    
-    # Process each tile
-    for ty in range(tiles_y):
-        for tx in range(tiles_x):
-            # Tile coordinates
-            x_start = tx * tile_size
-            y_start = ty * tile_size
-            x_end = min(x_start + tile_size, width)
-            y_end = min(y_start + tile_size, height)
-            tile_width = x_end - x_start
-            tile_height = y_end - y_start
-            
-            # Generate coordinates for this tile
-            x_indices = np.arange(x_start, x_end)
-            y_indices = np.arange(y_start, y_end)
-            
-            X_tile, Y_tile = np.meshgrid(
-                x_min + x_indices * x_scale,
-                y_min + y_indices * y_scale
-            )
-            
-            # Render tile
-            tile_result = mandelbrot_tile(X_tile, Y_tile, max_iter)
-            
-            # Place in main result
-            result[y_start:y_end, x_start:x_end] = tile_result
-            
-            # Update progress
-            pbar.update(1)
-    
-    pbar.close()
+    mandelbrot_set = mandelbrot_kernel(X, Y, max_iter)
     render_time = time.time() - start_time
     
     # Apply coloring
-    mandelbrot_set = np.log(result + 1)
+    mandelbrot_set = np.log(mandelbrot_set + 1)
     mandelbrot_set = (mandelbrot_set / np.max(mandelbrot_set)) * 255
     mandelbrot_set = np.uint8(mandelbrot_set)
     
@@ -111,75 +137,39 @@ def render_mandelbrot_tiled(width=1280, height=720, max_iter=8192,
     
     # Performance stats
     megapixels = (width * height) / 1e6
-    pixels_per_sec = megapixels / render_time if render_time > 0 else 0
+    speed = megapixels / render_time if render_time > 0 else 0
     
-    print(f"\n{'='*60}")
-    print(f"RENDER COMPLETE!")
-    print(f"Resolution: {width}x{height}")
-    print(f"Iterations: {max_iter}")
-    print(f"Tiles: {tiles_x}x{tiles_y} ({tile_size}x{tile_size})")
-    print(f"Render time: {render_time:.2f} seconds")
-    print(f"Speed: {pixels_per_sec:.2f} megapixels/sec")
+    print(f"\nRENDER COMPLETE!")
+    print(f"Time: {render_time:.2f} seconds")
+    print(f"Speed: {speed:.2f} MPix/sec")
     print(f"{'='*60}")
     
     return img, render_time
 
 
-def quick_test_tiled():
-    """Quick test with tiled rendering."""
-    print("Running tiled quick test...")
-    
-    img, time_taken = render_mandelbrot_tiled(
-        width=640,
-        height=480,
-        max_iter=256,
-        x_min=-2.0,
-        x_max=0.5,
-        y_min=-1.25,
-        y_max=1.25,
-        tile_size=128
-    )
-    
-    print(f"Tiled test completed in {time_taken:.2f} seconds")
-    
-    # Save
-    downloads_path = os.path.join(os.path.expanduser('~'), 'mandelbrot_tiled.png')
-    img.save(downloads_path)
-    print(f"Saved to: {downloads_path}")
-    
-    # ASCII preview
-    print("\nASCII Preview (40x20):")
-    data = np.array(img.resize((40, 20), Image.Resampling.LANCZOS))
-    chars = " .:-=+*#%@"
-    for row in data:
-        line = "".join(chars[pixel // 26] for pixel in row)
-        print(line)
-    
-    return img
-
-
-# Run the tiled version
 if __name__ == "__main__":
-    # First, run a quick test to verify it works
-    quick_test_tiled()
+    # Auto-adjust for Termux
+    if is_termux():
+        # Smaller settings for Termux
+        width, height = 800, 600
+        max_iter = 1024
+        print("📱 Termux detected - using mobile-optimized settings")
+    else:
+        # Full settings for desktop
+        width, height = 1280, 720
+        max_iter = 4096
     
-    # If that works, try the full render
-    print("\n" + "="*60)
-    print("STARTING TILED FULL RENDER")
-    print("="*60)
-    
-    img, render_time = render_mandelbrot_tiled(
-        width=1280,
-        height=720,
-        max_iter=8192,
+    img, time_taken = render_mandelbrot(
+        width=width,
+        height=height,
+        max_iter=max_iter,
         x_min=-0.178,
         x_max=-0.148,
         y_min=-1.0409375,
-        y_max=-1.0240625,
-        tile_size=128  # Smaller tiles for less memory
+        y_max=-1.0240625
     )
     
     # Save
-    downloads_path = os.path.join(os.path.expanduser('~'), 'mandelbrot_final_tiled.png')
-    img.save(downloads_path)
-    print(f"\nImage saved to: {downloads_path}")
+    filename = f"mandelbrot_{'termux' if is_termux() else 'desktop'}.png"
+    img.save(filename)
+    print(f"Saved: {filename}")
