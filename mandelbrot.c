@@ -1,5 +1,5 @@
 /**
- * Ultimate Mandelbrot Set Renderer
+ * Mandelbrot Set Renderer
  * ================================
  * Features:
  * 1. Multi-architecture: Scalar, SSE4, AVX2
