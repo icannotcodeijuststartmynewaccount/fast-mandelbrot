@@ -39,10 +39,10 @@ typedef struct {
     int max_iter;
     
     // Viewport
-    double x_min;
-    double x_max;
-    double y_min;
-    double y_max;
+    long double x_min;
+    long double x_max;
+    long double y_min;
+    long double y_max;
     
     // Performance settings
     int use_gpu;
@@ -78,8 +78,8 @@ typedef enum {
 typedef struct {
     int enabled;                  // Enable perturbation math
     PtbmPrecision precision;      // Precision mode
-    double reference_x;           // Reference point X
-    double reference_y;           // Reference point Y
+    long double reference_x;           // Reference point X
+    long double reference_y;           // Reference point Y
     int reference_iters;          // Reference iterations
     double zoom_level;            // Current zoom level
     double error_bound;           // Error bound for approximation
@@ -382,67 +382,98 @@ static int calculate_reference_iterations(double cx, double cy, int max_iter) {
     return iter;
 }
 
-// Calculate reference point (find a good escaping point)
+// Calculate reference point (find a good escaping point) - CLEAN VERSION
 static void calculate_reference_point(Config* cfg, PerturbationConfig* ptbm) {
-    // Try to find a good reference point that escapes
+    // Calculate zoom level (needed for both auto and manual)
+    double viewport_width = (double)(cfg->x_max - cfg->x_min);
+    ptbm->zoom_level = 4.0 / viewport_width;
+    
+    // Check if user provided a reference point (manual mode)
+    if (ptbm->reference_x != 0.0 || ptbm->reference_y != 0.0) {
+        printf("Manual reference point mode\n");
+        printf("User reference: (%.21Lf, %.21Lf)\n", ptbm->reference_x, ptbm->reference_y);
+        
+        // Calculate iterations for user reference
+        ptbm->reference_iters = calculate_reference_iterations(
+            (double)ptbm->reference_x, (double)ptbm->reference_y, cfg->max_iter);
+        
+        printf("Reference iterations: %d\n", ptbm->reference_iters);
+        
+        // Set precision mode based on zoom level if auto
+        if (ptbm->precision == PTBM_PRECISION_AUTO) {
+            if (ptbm->zoom_level > 1e15) {
+                ptbm->precision = PTBM_PRECISION_HIGH;
+                ptbm->use_glitch_correction = 1;
+            } else if (ptbm->zoom_level > 1e10) {
+                ptbm->precision = PTBM_PRECISION_MIXED;
+                ptbm->use_glitch_correction = 1;
+            } else if (ptbm->zoom_level > 1e6) {
+                ptbm->precision = PTBM_PRECISION_DOUBLE;
+            } else {
+                ptbm->precision = PTBM_PRECISION_SINGLE;
+            }
+        }
+        return;
+    }
+    
+    // AUTO MODE - find a good reference point
+    printf("Auto reference point mode\n");
+    
     // Start with center
-    double test_x = (cfg->x_min + cfg->x_max) / 2.0;
-    double test_y = (cfg->y_min + cfg->y_max) / 2.0;
+    long double test_x = (cfg->x_min + cfg->x_max) / 2.0L;
+    long double test_y = (cfg->y_min + cfg->y_max) / 2.0L;
     
-    // Test if center escapes
-    int iter = calculate_reference_iterations(test_x, test_y, cfg->max_iter);
+    int iter = calculate_reference_iterations((double)test_x, (double)test_y, cfg->max_iter);
     
-    // If center is inside the set, try other points
     if (iter == cfg->max_iter) {
         printf("Center is inside the set, searching for better reference...\n");
         
-        // Try points around the edge of the viewport
-        double step_x = (cfg->x_max - cfg->x_min) * 0.1;
-        double step_y = (cfg->y_max - cfg->y_min) * 0.1;
-        
-        int best_iter = cfg->max_iter;
-        double best_x = test_x;
-        double best_y = test_y;
-        
-        // Search grid for a point that escapes quickly
-        for (int i = -2; i <= 2; i++) {
-            for (int j = -2; j <= 2; j++) {
-                if (i == 0 && j == 0) continue; // Skip center
-                
-                double tx = test_x + i * step_x;
-                double ty = test_y + j * step_y;
-                
-                // Clamp to viewport
-                if (tx < cfg->x_min) tx = cfg->x_min;
-                if (tx > cfg->x_max) tx = cfg->x_max;
-                if (ty < cfg->y_min) ty = cfg->y_min;
-                if (ty > cfg->y_max) ty = cfg->y_max;
-                
-                int titer = calculate_reference_iterations(tx, ty, cfg->max_iter);
-                
-                // Prefer points that escape (iter < max_iter) with lower iterations
-                if (titer < cfg->max_iter && titer < best_iter) {
-                    best_iter = titer;
-                    best_x = tx;
-                    best_y = ty;
-                }
-            }
-        }
-        
-        ptbm->reference_x = best_x;
-        ptbm->reference_y = best_y;
-        ptbm->reference_iters = best_iter;  // IMPORTANT: Save the iterations!
-        printf("Found reference point at (%0.16f, %0.16f) with %d iterations\n", 
-               best_x, best_y, best_iter);
+        // Try points at the corners and edges
+        long double candidates[][2] = {
+    {cfg->x_min, cfg->y_min},
+    {cfg->x_min, cfg->y_max},
+    {cfg->x_max, cfg->y_min},
+    {cfg->x_max, cfg->y_max},
+    {cfg->x_min, (cfg->y_min + cfg->y_max) / 2.0L},
+    {cfg->x_max, (cfg->y_min + cfg->y_max) / 2.0L},
+    {(cfg->x_min + cfg->x_max) / 2.0L, cfg->y_min},
+    {(cfg->x_min + cfg->x_max) / 2.0L, cfg->y_max}
+};
+
+int best_iter = -1;  // Start with -1 (no valid reference yet)
+long double best_x = test_x;
+long double best_y = test_y;
+
+for (int i = 0; i < 8; i++) {
+    int titer = calculate_reference_iterations((double)candidates[i][0], (double)candidates[i][1], cfg->max_iter);
+    // Look for iterations that escape (titer < max_iter) and are HIGH
+    if (titer < cfg->max_iter && titer > best_iter) {
+        best_iter = titer;
+        best_x = candidates[i][0];
+        best_y = candidates[i][1];
+    }
+}
+
+// If still no good reference found (all points inside set), use center
+if (best_iter == -1) {
+    best_iter = calculate_reference_iterations((double)test_x, (double)test_y, cfg->max_iter);
+    best_x = test_x;
+    best_y = test_y;
+    printf("Warning: No escaping reference found, using center (may cause issues)\n");
+}
+
+ptbm->reference_x = best_x;
+ptbm->reference_y = best_y;
+ptbm->reference_iters = best_iter;
+printf("Auto reference point: (%.21Lf, %.21Lf) with %d iterations\n", 
+       best_x, best_y, best_iter);
     } else {
         ptbm->reference_x = test_x;
         ptbm->reference_y = test_y;
-        ptbm->reference_iters = iter;  // IMPORTANT: Save the iterations!
+        ptbm->reference_iters = iter;
+        printf("Center escapes: using (%.21Lf, %.21Lf) with %d iterations\n", 
+               test_x, test_y, iter);
     }
-    
-    // Calculate zoom level
-    double viewport_width = cfg->x_max - cfg->x_min;
-    ptbm->zoom_level = 4.0 / viewport_width;
     
     // Set precision mode based on zoom level if auto
     if (ptbm->precision == PTBM_PRECISION_AUTO) {
@@ -458,7 +489,7 @@ static void calculate_reference_point(Config* cfg, PerturbationConfig* ptbm) {
             ptbm->precision = PTBM_PRECISION_SINGLE;
         }
     }
-} 
+}
 
 // Double precision perturbation - CORRECT VERSION
 static inline int mandelbrot_perturbation_double(
@@ -859,10 +890,10 @@ static const char* mandelbrot_kernel_source =
 "}";
 
 /* ===========================================
-   COMPLETELY REWRITTEN GPU Perturbation Kernel
+   FIXED GPU Perturbation Kernel - Continue after reference escapes
    =========================================== */
 static const char* mandelbrot_perturbation_kernel_source = 
-"// Mandelbrot GPU Perturbation Kernel - FIXED VERSION\n"
+"// Mandelbrot GPU Perturbation Kernel - FIXED\n"
 "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n"
 "\n"
 "__kernel void mandelbrot_perturbation_gpu(\n"
@@ -891,72 +922,66 @@ static const char* mandelbrot_perturbation_kernel_source =
 "    // Delta from reference\n"
 "    double dx = cx - ref_x;\n"
 "    double dy = cy - ref_y;\n"
+"    double dcx = dx;\n"
+"    double dcy = dy;\n"
 "    \n"
 "    // Reference orbit\n"
-"    double X = 0.0;\n"
-"    double Y = 0.0;\n"
+"    double X = 0.0, Y = 0.0;\n"
+"    double X2 = 0.0, Y2 = 0.0;\n"
 "    \n"
 "    int iter = 0;\n"
-"    int inside = 1;\n"
 "    \n"
-"    // Pre-calculate reference orbit iterations\n"
-"    while (iter < ref_iters && iter < max_iter && inside) {\n"
+"    // IMPORTANT: Continue to max_iter, not ref_iters!\n"
+"    // Reference may escape early, but perturbation continues\n"
+"    while (iter < max_iter) {\n"
 "        // Calculate actual point\n"
-"        double x_actual = X + dx;\n"
-"        double y_actual = Y + dy;\n"
-"        double r2 = x_actual*x_actual + y_actual*y_actual;\n"
+"        double zx = X + dx;\n"
+"        double zy = Y + dy;\n"
+"        double r2 = zx*zx + zy*zy;\n"
 "        \n"
 "        if (r2 >= 4.0) {\n"
-"            inside = 0;\n"
 "            break;\n"
 "        }\n"
 "        \n"
-"        // Update delta\n"
-"        double new_dx = 2.0 * X * dx - 2.0 * Y * dy + dx*dx - dy*dy;\n"
-"        double new_dy = 2.0 * X * dy + 2.0 * Y * dx + 2.0 * dx * dy;\n"
+"        // Update delta (perturbation formula)\n"
+"        double new_dx = 2.0 * X * dx - 2.0 * Y * dy + dx*dx - dy*dy + dcx;\n"
+"        double new_dy = 2.0 * X * dy + 2.0 * Y * dx + 2.0 * dx * dy + dcy;\n"
 "        \n"
-"        // Add the original delta c\n"
-"        new_dx += (cx - ref_x);\n"
-"        new_dy += (cy - ref_y);\n"
-"        \n"
-"        // Update reference\n"
-"        double new_X = X*X - Y*Y + ref_x;\n"
+"        // Update reference (even if it escaped, continue the math)\n"
+"        double new_X = X2 - Y2 + ref_x;\n"
 "        double new_Y = 2.0 * X * Y + ref_y;\n"
 "        \n"
 "        dx = new_dx;\n"
 "        dy = new_dy;\n"
 "        X = new_X;\n"
 "        Y = new_Y;\n"
+"        X2 = X*X;\n"
+"        Y2 = Y*Y;\n"
 "        \n"
 "        iter++;\n"
 "    }\n"
 "    \n"
 "    // Color calculation\n"
+"    float t = (float)iter / max_iter;\n"
 "    int idx = (y * width + x) * 3;\n"
 "    \n"
-"    if (inside && iter >= max_iter) {\n"
-"        // Inside the set - black\n"
+"    if (iter == max_iter) {\n"
 "        output[idx] = 0;\n"
 "        output[idx+1] = 0;\n"
 "        output[idx+2] = 0;\n"
+"    } else if (grayscale) {\n"
+"        float value = pow(t, gamma) * brightness;\n"
+"        if (value > 1.0f) value = 1.0f;\n"
+"        uchar grey = (uchar)(value * 255.0f);\n"
+"        output[idx] = output[idx+1] = output[idx+2] = grey;\n"
 "    } else {\n"
-"        // Escaped - calculate color based on iteration count\n"
-"        float t = (float)iter / max_iter;\n"
-"        \n"
-"        if (grayscale) {\n"
-"            float value = pow(t, gamma) * brightness;\n"
-"            if (value > 1.0f) value = 1.0f;\n"
-"            uchar grey = (uchar)(value * 255.0f);\n"
-"            output[idx] = output[idx+1] = output[idx+2] = grey;\n"
-"        } else {\n"
-"            float sqrt_t = sqrt(t);\n"
-"            float r_val = (0.5f + 0.5f * sin(sqrt_t * 2.0f * M_PI)) * brightness;\n"
-"            float g_val = (0.5f + 0.5f * sin(sqrt_t * 2.0f * M_PI + 2.0f*M_PI/3.0f)) * brightness;\n"
-"            float b_val = (0.5f + 0.5f * sin(sqrt_t * 2.0f * M_PI + 4.0f*M_PI/3.0f)) * brightness;\n"
-"            output[idx] = (uchar)(r_val * 255.0f);\n"
-"            output[idx+1] = (uchar)(g_val * 255.0f);\n"
-"            output[idx+2] = (uchar)(b_val * 255.0f);\n"
-"        }\n"
+"        float sqrt_t = sqrt(t);\n"
+"        float r_val = (0.5f + 0.5f * sin(sqrt_t * 2.0f * M_PI)) * brightness;\n"
+"        float g_val = (0.5f + 0.5f * sin(sqrt_t * 2.0f * M_PI + 2.0f*M_PI/3.0f)) * brightness;\n"
+"        float b_val = (0.5f + 0.5f * sin(sqrt_t * 2.0f * M_PI + 4.0f*M_PI/3.0f)) * brightness;\n"
+"        output[idx] = (uchar)(r_val * 255.0f);\n"
+"        output[idx+1] = (uchar)(g_val * 255.0f);\n"
+"        output[idx+2] = (uchar)(b_val * 255.0f);\n"
 "    }\n"
 "}";
 
@@ -1234,7 +1259,16 @@ static double gpu_perturbation_render(Config* cfg, PerturbationConfig* ptbm, uin
     if (!g_ctx.initialized && !gpu_init()) {
         return -1.0;
     }
+
+    printf("DEBUG: Entering gpu_perturbation_render\n");
+    printf("DEBUG: ptbm pointer = %p\n", ptbm);
+    printf("DEBUG: ptbm->reference_x = %.21Lf\n", ptbm->reference_x);
+    printf("DEBUG: ptbm->reference_y = %.21Lf\n", ptbm->reference_y);
+    printf("DEBUG: ptbm->reference_iters = %d\n", ptbm->reference_iters);
     
+    // Rest of your function...
+
+
     cl_int err;
     cl_event event;
     
@@ -1286,6 +1320,14 @@ static double gpu_perturbation_render(Config* cfg, PerturbationConfig* ptbm, uin
     err |= clSetKernelArg(kernel, 1, sizeof(double), &ptbm->reference_x);
     err |= clSetKernelArg(kernel, 2, sizeof(double), &ptbm->reference_y);
     err |= clSetKernelArg(kernel, 3, sizeof(int), &ptbm->reference_iters);
+    double x_min = (double)cfg->x_min;
+    double x_max = (double)cfg->x_max;
+    double y_min = (double)cfg->y_min;
+    double y_max = (double)cfg->y_max;
+    err |= clSetKernelArg(kernel, 4, sizeof(double), &x_min);
+    err |= clSetKernelArg(kernel, 5, sizeof(double), &x_max);
+    err |= clSetKernelArg(kernel, 6, sizeof(double), &y_min);
+    err |= clSetKernelArg(kernel, 7, sizeof(double), &y_max);
     err |= clSetKernelArg(kernel, 4, sizeof(double), &cfg->x_min);
     err |= clSetKernelArg(kernel, 5, sizeof(double), &cfg->x_max);
     err |= clSetKernelArg(kernel, 6, sizeof(double), &cfg->y_min);
@@ -1332,7 +1374,7 @@ static double gpu_perturbation_render(Config* cfg, PerturbationConfig* ptbm, uin
     
     // DEBUG: Print reference info
     printf("\nGPU Perturbation Debug Info:\n");
-    printf("  Reference point: (%0.16f, %0.16f)\n", ptbm->reference_x, ptbm->reference_y);
+    printf("  Reference point: (%0.21Lf, %0.21Lf)\n", ptbm->reference_x, ptbm->reference_y);
     printf("  Reference iterations: %d\n", ptbm->reference_iters);
     printf("  Max iterations: %d\n", cfg->max_iter);
     printf("  Image size: %dx%d\n", cfg->width, cfg->height);
@@ -1834,13 +1876,25 @@ static void parse_args(int argc, char** argv, Config* cfg, PerturbationConfig* p
         } else if (strcmp(argv[i], "--iter") == 0 || strcmp(argv[i], "-i") == 0) {
             if (++i < argc) cfg->max_iter = atoi(argv[i]);
         } else if (strcmp(argv[i], "--xmin") == 0 || strcmp(argv[i], "-x") == 0) {
-            if (++i < argc) cfg->x_min = atof(argv[i]);
+            if (++i < argc) {
+                sscanf(argv[i], "%Lf", &cfg->x_min);
+                printf("DEBUG: Set x_min = %.21Lf from '%s'\n", cfg->x_min, argv[i]);
+            }
         } else if (strcmp(argv[i], "--xmax") == 0 || strcmp(argv[i], "-X") == 0) {
-            if (++i < argc) cfg->x_max = atof(argv[i]);
+            if (++i < argc) {
+                sscanf(argv[i], "%Lf", &cfg->x_max);
+                printf("DEBUG: Set x_max = %.21Lf from '%s'\n", cfg->x_max, argv[i]);
+            }
         } else if (strcmp(argv[i], "--ymin") == 0 || strcmp(argv[i], "-y") == 0) {
-            if (++i < argc) cfg->y_min = atof(argv[i]);
+            if (++i < argc) {
+                sscanf(argv[i], "%Lf", &cfg->y_min);
+                printf("DEBUG: Set y_min = %.21Lf from '%s'\n", cfg->y_min, argv[i]);
+            }
         } else if (strcmp(argv[i], "--ymax") == 0 || strcmp(argv[i], "-Y") == 0) {
-            if (++i < argc) cfg->y_max = atof(argv[i]);
+            if (++i < argc) {
+                sscanf(argv[i], "%Lf", &cfg->y_max);
+                printf("DEBUG: Set y_max = %.21Lf from '%s'\n", cfg->y_max, argv[i]);
+            }
         } else if (strcmp(argv[i], "--grayscale") == 0 || strcmp(argv[i], "-g") == 0) {
             cfg->grayscale = 1;
         } else if (strcmp(argv[i], "--output") == 0 || strcmp(argv[i], "-o") == 0) {
@@ -1877,9 +1931,11 @@ static void parse_args(int argc, char** argv, Config* cfg, PerturbationConfig* p
             ptbm->use_glitch_correction = 0;
         } else if (strcmp(argv[i], "--ptbm-ref") == 0 && i+2 < argc) {
             i++;
-            ptbm->reference_x = atof(argv[i]);
+            sscanf(argv[i], "%Lf", &ptbm->reference_x);
+            printf("DEBUG: Set ref_x = %.21Lf\n", ptbm->reference_x);
             i++;
-            ptbm->reference_y = atof(argv[i]);
+            sscanf(argv[i], "%Lf", &ptbm->reference_y);
+            printf("DEBUG: Set ref_y = %.21Lf\n", ptbm->reference_y);
         }
     }
 }
@@ -1936,15 +1992,15 @@ int main(int argc, char** argv) {
     if (ptbm.enabled) {
         calculate_reference_point(&cfg, &ptbm);
     }
-    
+
     printf("=== Ultimate Mandelbrot Renderer ===\n");
     printf("Resolution: %dx%d\n", cfg.width, cfg.height);
     printf("Iterations: %d\n", cfg.max_iter);
-    printf("Viewport: [%.6f, %.6f] x [%.6f, %.6f]\n", 
+    printf("Viewport: [%.21Lf, %.21Lf] x [%.21Lf, %.21Lf]\n", 
            cfg.x_min, cfg.x_max, cfg.y_min, cfg.y_max);
     if (ptbm.enabled) {
         printf("Perturbation: Enabled\n");
-        printf("Reference point: (%.16f, %.16f)\n", ptbm.reference_x, ptbm.reference_y);
+        printf("Reference point: (%.21Lf, %.21Lf)\n", ptbm.reference_x, ptbm.reference_y);
     } else {
         printf("Perturbation: Disabled\n");
     }
