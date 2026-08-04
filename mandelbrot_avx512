@@ -1,0 +1,1311 @@
+/**
+ * Ultimate Mandelbrot Set Renderer
+ * ================================
+ * Features:
+ * 1. Multi-architecture: Scalar, SSE4, AVX2, AVX-512
+ * 2. GPU offloading via OpenCL (optional)
+ * 3. Automatic CPU feature detection
+ * 4. Grayscale and color modes
+ * 5. Configurable from command line
+ * 6. Performance benchmarking
+ * 7. TILE RENDERING + AUTO-STITCHING (new)
+ * 
+ * Build (AVX-512):
+ *   gcc -O3 -march=native -mavx512f -mavx512bw -mavx512dq -mavx512vl -DUSE_OPENCL mandelbrot_tiles_final.c -o mandelbrot_tiles.exe -lm -lpng -fopenmp -lOpenCL
+ * 
+ * Build (AVX2):
+ *   gcc -O3 -march=native -mavx2 -DUSE_OPENCL mandelbrot_tiles_final.c -o mandelbrot_tiles.exe -lm -lpng -fopenmp -lOpenCL
+ * 
+ * Usage:
+ *   mandelbrot [options]
+ *   mandelbrot --avx512 -w 40000 -h 20000 --tile-size 3840 -o huge.png
+ */
+
+#include <omp.h>
+#include <png.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <math.h>
+#include <time.h>
+
+#ifdef _WIN32
+#include <intrin.h>
+#include <windows.h>
+#include <direct.h>
+#else
+#include <unistd.h>
+#include <cpuid.h>
+#include <sys/stat.h>
+#endif
+
+#define CL_TARGET_OPENCL_VERSION 300
+
+/* ===========================================
+   Configuration System
+   =========================================== */
+
+typedef struct {
+    int width;
+    int height;
+    int max_iter;
+    double x_min;
+    double x_max;
+    double y_min;
+    double y_max;
+    int use_gpu;
+    int use_avx2;
+    int use_avx512;
+    int use_sse4;
+    int num_threads;
+    int grayscale;
+    int benchmark;
+    const char* output_file;
+    float gamma;
+    float brightness;
+    int cpu_features;
+    
+    // Tile rendering settings
+    int use_tiles;
+    int tile_size;
+    char tile_dir[256];
+} Config;
+
+/* ===========================================
+   CPU Feature Detection
+   =========================================== */
+
+typedef enum {
+    CPU_FEATURE_NONE   = 0,
+    CPU_FEATURE_SSE    = 1 << 0,
+    CPU_FEATURE_SSE2   = 1 << 1,
+    CPU_FEATURE_SSE3   = 1 << 2,
+    CPU_FEATURE_SSSE3  = 1 << 3,
+    CPU_FEATURE_SSE4_1 = 1 << 4,
+    CPU_FEATURE_SSE4_2 = 1 << 5,
+    CPU_FEATURE_AVX    = 1 << 6,
+    CPU_FEATURE_AVX2   = 1 << 7,
+    CPU_FEATURE_FMA    = 1 << 8,
+    CPU_FEATURE_AVX512 = 1 << 9
+} CPUFeature;
+
+static int detect_cpu_features(void) {
+    int features = CPU_FEATURE_NONE;
+    
+#ifdef _WIN32
+    int cpu_info[4];
+    __cpuid(cpu_info, 1);
+    
+    if (cpu_info[2] & (1 << 20)) features |= CPU_FEATURE_SSE4_2;
+    if (cpu_info[2] & (1 << 19)) features |= CPU_FEATURE_SSE4_1;
+    if (cpu_info[2] & (1 << 9))  features |= CPU_FEATURE_SSSE3;
+    if (cpu_info[2] & (1 << 0))  features |= CPU_FEATURE_SSE3;
+    if (cpu_info[3] & (1 << 26)) features |= CPU_FEATURE_SSE2;
+    if (cpu_info[3] & (1 << 25)) features |= CPU_FEATURE_SSE;
+    if (cpu_info[2] & (1 << 28)) features |= CPU_FEATURE_AVX;
+    if (cpu_info[2] & (1 << 12)) features |= CPU_FEATURE_FMA;
+    
+    __cpuidex(cpu_info, 7, 0);
+    if (cpu_info[1] & (1 << 5)) features |= CPU_FEATURE_AVX2;
+    if (cpu_info[1] & (1 << 16)) features |= CPU_FEATURE_AVX512;  // AVX-512F
+#else
+    unsigned int eax, ebx, ecx, edx;
+    
+    __cpuid(1, eax, ebx, ecx, edx);
+    if (ecx & (1 << 20)) features |= CPU_FEATURE_SSE4_2;
+    if (ecx & (1 << 19)) features |= CPU_FEATURE_SSE4_1;
+    if (ecx & (1 << 9))  features |= CPU_FEATURE_SSSE3;
+    if (ecx & (1 << 0))  features |= CPU_FEATURE_SSE3;
+    if (edx & (1 << 26)) features |= CPU_FEATURE_SSE2;
+    if (edx & (1 << 25)) features |= CPU_FEATURE_SSE;
+    if (ecx & (1 << 28)) features |= CPU_FEATURE_AVX;
+    if (ecx & (1 << 12)) features |= CPU_FEATURE_FMA;
+    
+    __cpuid_count(7, 0, eax, ebx, ecx, edx);
+    if (ebx & (1 << 5)) features |= CPU_FEATURE_AVX2;
+    if (ebx & (1 << 16)) features |= CPU_FEATURE_AVX512;  // AVX-512F
+#endif
+    
+    return features;
+}
+
+// ========== FORWARD DECLARATIONS ==========
+static int save_png(const char* filename, uint8_t* image, int width, int height);
+static int save_ppm(const char* filename, uint8_t* image, int width, int height);
+static int stitch_tiles(Config* cfg);
+static int stitch_with_imagemagick(Config* cfg);
+
+/* ===========================================
+   SIMD Headers (Conditional)
+   =========================================== */
+
+#ifdef __SSE4_2__
+#include <nmmintrin.h>
+#endif
+
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+
+#ifdef __AVX512F__
+#include <immintrin.h>
+#endif
+
+/* ===========================================
+   Scalar Implementation
+   =========================================== */
+
+static inline int mandelbrot_scalar(double x0, double y0, int max_iter) {
+    double x = 0.0, y = 0.0;
+    double x2 = 0.0, y2 = 0.0;
+    int iter = 0;
+    
+    while (x2 + y2 < 4.0 && iter < max_iter) {
+        y = 2.0 * x * y + y0;
+        x = x2 - y2 + x0;
+        x2 = x * x;
+        y2 = y * y;
+        iter++;
+    }
+    
+    return iter;
+}
+
+/* ===========================================
+   AVX2 Implementation
+   =========================================== */
+#ifdef __AVX2__
+static inline void mandelbrot_avx2(
+    __m256d x0,
+    __m256d y0,
+    int max_iter,
+    int results[4]
+) {
+    __m256d x  = _mm256_setzero_pd();
+    __m256d y  = _mm256_setzero_pd();
+    __m256d x2 = _mm256_setzero_pd();
+    __m256d y2 = _mm256_setzero_pd();
+
+    __m256d two  = _mm256_set1_pd(2.0);
+    __m256d four = _mm256_set1_pd(4.0);
+
+    __m256i counters = _mm256_setzero_si256();
+    __m256i one      = _mm256_set1_epi64x(1);
+
+    for (int iter = 0; iter < max_iter; iter++) {
+        __m256d r2 = _mm256_add_pd(x2, y2);
+        __m256d mask_pd = _mm256_cmp_pd(r2, four, _CMP_LT_OQ);
+        int active_mask = _mm256_movemask_pd(mask_pd);
+        if (active_mask == 0) break;
+
+        __m256i mask_i = _mm256_castpd_si256(mask_pd);
+        counters = _mm256_add_epi64(counters, _mm256_and_si256(mask_i, one));
+
+        __m256d xy = _mm256_mul_pd(x, y);
+        y = _mm256_fmadd_pd(two, xy, y0);
+        x = _mm256_add_pd(_mm256_sub_pd(x2, y2), x0);
+
+        x2 = _mm256_mul_pd(x, x);
+        y2 = _mm256_mul_pd(y, y);
+    }
+
+    long long tmp[4];
+    _mm256_storeu_si256((__m256i*)tmp, counters);
+    for (int i = 0; i < 4; i++)
+        results[i] = (int)tmp[i];
+}
+#endif
+
+/* ===========================================
+   AVX-512 Implementation (NEW)
+   =========================================== */
+#ifdef __AVX512F__
+static inline void mandelbrot_avx512(
+    __m512d x0,
+    __m512d y0,
+    int max_iter,
+    int results[8]
+) {
+    __m512d x  = _mm512_setzero_pd();
+    __m512d y  = _mm512_setzero_pd();
+    __m512d x2 = _mm512_setzero_pd();
+    __m512d y2 = _mm512_setzero_pd();
+
+    __m512d two  = _mm512_set1_pd(2.0);
+    __m512d four = _mm512_set1_pd(4.0);
+
+    __m512i counters = _mm512_setzero_si512();
+    __m512i one      = _mm512_set1_epi64(1);
+
+    for (int iter = 0; iter < max_iter; iter++) {
+        __m512d r2 = _mm512_add_pd(x2, y2);
+        __mmask8 mask = _mm512_cmp_pd_mask(r2, four, _CMP_LT_OQ);
+        if (mask == 0) break;
+
+        counters = _mm512_mask_add_epi64(counters, mask, counters, one);
+
+        __m512d xy = _mm512_mul_pd(x, y);
+        y = _mm512_fmadd_pd(two, xy, y0);
+        x = _mm512_add_pd(_mm512_sub_pd(x2, y2), x0);
+
+        x2 = _mm512_mul_pd(x, x);
+        y2 = _mm512_mul_pd(y, y);
+    }
+
+    long long tmp[8];
+    _mm512_storeu_si512((__m512i*)tmp, counters);
+    for (int i = 0; i < 8; i++)
+        results[i] = (int)tmp[i];
+}
+#endif
+
+/* ===========================================
+   Color Management
+   =========================================== */
+static inline void get_color(int iter, int max_iter, int grayscale, 
+                            float gamma, float brightness,
+                            uint8_t* r, uint8_t* g, uint8_t* b) {
+    if (iter == max_iter) {
+        *r = *g = *b = 0;
+        return;
+    }
+    
+    double t = (double)iter / max_iter;
+    
+    if (grayscale) {
+        double value = pow(t, gamma) * brightness;
+        if (value > 1.0) value = 1.0;
+        if (value < 0.0) value = 0.0;
+        uint8_t grey = (uint8_t)(value * 255.0);
+        *r = *g = *b = grey;
+    } else {
+        double sqrt_t = sqrt(t);
+        double r_val = (0.5 + 0.5 * sin(sqrt_t * 2.0 * M_PI)) * brightness;
+        double g_val = (0.5 + 0.5 * sin(sqrt_t * 2.0 * M_PI + 2.0 * M_PI / 3.0)) * brightness;
+        double b_val = (0.5 + 0.5 * sin(sqrt_t * 2.0 * M_PI + 4.0 * M_PI / 3.0)) * brightness;
+        
+        if (r_val > 1.0) r_val = 1.0;
+        if (g_val > 1.0) g_val = 1.0;
+        if (b_val > 1.0) b_val = 1.0;
+        if (r_val < 0.0) r_val = 0.0;
+        if (g_val < 0.0) g_val = 0.0;
+        if (b_val < 0.0) b_val = 0.0;
+        
+        *r = (uint8_t)(r_val * 255);
+        *g = (uint8_t)(g_val * 255);
+        *b = (uint8_t)(b_val * 255);
+    }
+}
+
+/* ===========================================
+   GPU OpenCL Support (unchanged)
+   =========================================== */
+
+#ifdef USE_OPENCL
+#include <CL/cl.h>
+
+static const char* mandelbrot_kernel_source = 
+"__kernel void mandelbrot_gpu(\n"
+"    __global uchar* output,\n"
+"    const double x_min,\n"
+"    const double x_max,\n"
+"    const double y_min,\n"
+"    const double y_max,\n"
+"    const int width,\n"
+"    const int height,\n"
+"    const int max_iter,\n"
+"    const int grayscale,\n"
+"    const float gamma,\n"
+"    const float brightness)\n"
+"{\n"
+"    int x = get_global_id(0);\n"
+"    int y = get_global_id(1);\n"
+"    if (x >= width || y >= height) return;\n"
+"    \n"
+"    double x0 = x_min + (x_max - x_min) * x / width;\n"
+"    double y0 = y_min + (y_max - y_min) * y / height;\n"
+"    double q = (x0 - 0.25) * (x0 - 0.25) + y0 * y0;\n"
+"    if (q * (q + (x0 - 0.25)) < 0.25 * y0 * y0) {\n"
+"        int idx = (y * width + x) * 3;\n"
+"        output[idx] = output[idx+1] = output[idx+2] = 0;\n"
+"        return;\n"
+"    }\n"
+"    \n"
+"    double x_plus1 = x0 + 1.0;\n"
+"    if (x_plus1 * x_plus1 + y0 * y0 < 0.0625) {\n"
+"        int idx = (y * width + x) * 3;\n"
+"        output[idx] = output[idx+1] = output[idx+2] = 0;\n"
+"        return;\n"
+"    }\n"
+"    \n"
+"    double zx = 0.0, zy = 0.0;\n"
+"    double zx2 = 0.0, zy2 = 0.0;\n"
+"    int iter = 0;\n"
+"    \n"
+"    while (zx2 + zy2 <= 4.0 && iter < max_iter) {\n"
+"        zy = 2.0 * zx * zy + y0;\n"
+"        zx = zx2 - zy2 + x0;\n"
+"        zx2 = zx * zx;\n"
+"        zy2 = zy * zy;\n"
+"        iter++;\n"
+"    }\n"
+"    \n"
+"    float t = (float)iter / max_iter;\n"
+"    int idx = (y * width + x) * 3;\n"
+"    \n"
+"    if (iter == max_iter) {\n"
+"        output[idx] = output[idx+1] = output[idx+2] = 0;\n"
+"    } else if (grayscale) {\n"
+"        float value = pow(t, gamma) * brightness;\n"
+"        if (value > 1.0f) value = 1.0f;\n"
+"        uchar grey = (uchar)(value * 255.0f);\n"
+"        output[idx] = output[idx+1] = output[idx+2] = grey;\n"
+"    } else {\n"
+"        float sqrt_t = sqrt(t);\n"
+"        float r_val = (0.5f + 0.5f * sin(sqrt_t * 2.0f * M_PI)) * brightness;\n"
+"        float g_val = (0.5f + 0.5f * sin(sqrt_t * 2.0f * M_PI + 2.0f*M_PI/3.0f)) * brightness;\n"
+"        float b_val = (0.5f + 0.5f * sin(sqrt_t * 2.0f * M_PI + 4.0f*M_PI/3.0f)) * brightness;\n"
+"        output[idx] = (uchar)(r_val * 255.0f);\n"
+"        output[idx+1] = (uchar)(g_val * 255.0f);\n"
+"        output[idx+2] = (uchar)(b_val * 255.0f);\n"
+"    }\n"
+"}";
+
+typedef struct {
+    cl_platform_id platform;
+    cl_device_id device;
+    cl_context context;
+    cl_command_queue queue;
+    cl_program program;
+    cl_kernel kernel;
+    cl_mem buffer_output;
+    size_t max_work_group_size;
+    int supports_double;
+    int initialized;
+} GPUContext;
+
+static GPUContext g_ctx = {0};
+
+static void gpu_print_info(void) {
+    char device_name[256], vendor_name[256];
+    cl_device_type device_type;
+    cl_ulong global_mem;
+    cl_uint compute_units;
+    
+    clGetDeviceInfo(g_ctx.device, CL_DEVICE_NAME, sizeof(device_name), device_name, NULL);
+    clGetDeviceInfo(g_ctx.device, CL_DEVICE_VENDOR, sizeof(vendor_name), vendor_name, NULL);
+    clGetDeviceInfo(g_ctx.device, CL_DEVICE_TYPE, sizeof(device_type), &device_type, NULL);
+    clGetDeviceInfo(g_ctx.device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(global_mem), &global_mem, NULL);
+    clGetDeviceInfo(g_ctx.device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(compute_units), &compute_units, NULL);
+    
+    printf("GPU Device: %s\n", device_name);
+    printf("Vendor: %s\n", vendor_name);
+    printf("Type: %s\n", device_type == CL_DEVICE_TYPE_GPU ? "GPU" : "CPU");
+    printf("Global Memory: %.1f MB\n", global_mem / (1024.0 * 1024.0));
+    printf("Compute Units: %u\n", compute_units);
+    printf("Max Work Group: %zu\n", g_ctx.max_work_group_size);
+}
+
+static int gpu_init(void) {
+    cl_int err;
+    cl_uint num_platforms;
+    
+    err = clGetPlatformIDs(1, &g_ctx.platform, &num_platforms);
+    if (err != CL_SUCCESS || num_platforms == 0) {
+        fprintf(stderr, "No OpenCL platforms found\n");
+        return 0;
+    }
+    
+    cl_device_id devices[16];
+    cl_uint num_devices;
+    err = clGetDeviceIDs(g_ctx.platform, CL_DEVICE_TYPE_GPU, 16, devices, &num_devices);
+    if (err != CL_SUCCESS || num_devices == 0) {
+        err = clGetDeviceIDs(g_ctx.platform, CL_DEVICE_TYPE_ALL, 16, devices, &num_devices);
+    }
+    
+    if (err != CL_SUCCESS || num_devices == 0) {
+        fprintf(stderr, "No OpenCL devices found\n");
+        return 0;
+    }
+    
+    g_ctx.device = devices[0];
+    for (cl_uint i = 0; i < num_devices; i++) {
+        cl_device_type type;
+        clGetDeviceInfo(devices[i], CL_DEVICE_TYPE, sizeof(type), &type, NULL);
+        if (type == CL_DEVICE_TYPE_GPU) {
+            g_ctx.device = devices[i];
+            char vendor[256];
+            clGetDeviceInfo(devices[i], CL_DEVICE_VENDOR, sizeof(vendor), vendor, NULL);
+            if (strstr(vendor, "NVIDIA") || strstr(vendor, "AMD")) break;
+        }
+    }
+    
+    char extensions[1024];
+    clGetDeviceInfo(g_ctx.device, CL_DEVICE_EXTENSIONS, sizeof(extensions), extensions, NULL);
+    g_ctx.supports_double = strstr(extensions, "cl_khr_fp64") != NULL;
+    
+    if (!g_ctx.supports_double)
+        printf("Warning: GPU doesn't support double precision.\n");
+    
+    clGetDeviceInfo(g_ctx.device, CL_DEVICE_MAX_WORK_GROUP_SIZE, 
+                   sizeof(g_ctx.max_work_group_size), &g_ctx.max_work_group_size, NULL);
+    
+    g_ctx.context = clCreateContext(NULL, 1, &g_ctx.device, NULL, NULL, &err);
+    if (err != CL_SUCCESS) { fprintf(stderr, "Failed to create context\n"); return 0; }
+    
+    cl_queue_properties props[] = {CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, 0};
+    g_ctx.queue = clCreateCommandQueueWithProperties(g_ctx.context, g_ctx.device, props, &err);
+    if (err != CL_SUCCESS) { fprintf(stderr, "Failed to create command queue\n"); return 0; }
+    
+    g_ctx.program = clCreateProgramWithSource(g_ctx.context, 1, &mandelbrot_kernel_source, NULL, &err);
+    if (err != CL_SUCCESS) { fprintf(stderr, "Failed to create program\n"); return 0; }
+    
+    const char* options = g_ctx.supports_double ? 
+        "-cl-fast-relaxed-math -cl-mad-enable -cl-no-signed-zeros" :
+        "-cl-fast-relaxed-math -cl-mad-enable -cl-no-signed-zeros -DUSE_FLOAT";
+    
+    err = clBuildProgram(g_ctx.program, 1, &g_ctx.device, options, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        char build_log[8192];
+        clGetProgramBuildInfo(g_ctx.program, g_ctx.device, CL_PROGRAM_BUILD_LOG, sizeof(build_log), build_log, NULL);
+        fprintf(stderr, "Build failed:\n%s\n", build_log);
+        return 0;
+    }
+    
+    g_ctx.kernel = clCreateKernel(g_ctx.program, "mandelbrot_gpu", &err);
+    if (err != CL_SUCCESS) { fprintf(stderr, "Failed to create kernel\n"); return 0; }
+    
+    g_ctx.initialized = 1;
+    gpu_print_info();
+    return 1;
+}
+
+static void gpu_cleanup(void) {
+    if (g_ctx.buffer_output) clReleaseMemObject(g_ctx.buffer_output);
+    if (g_ctx.kernel) clReleaseKernel(g_ctx.kernel);
+    if (g_ctx.program) clReleaseProgram(g_ctx.program);
+    if (g_ctx.queue) clReleaseCommandQueue(g_ctx.queue);
+    if (g_ctx.context) clReleaseContext(g_ctx.context);
+    memset(&g_ctx, 0, sizeof(g_ctx));
+}
+
+// ========== UTILITY FUNCTIONS ==========
+
+static void create_directory(const char* path) {
+#ifdef _WIN32
+    _mkdir(path);
+#else
+    mkdir(path, 0755);
+#endif
+}
+
+// ========== TILE RENDERING FUNCTIONS ==========
+
+static double gpu_render(Config* cfg, uint8_t* image);
+
+static double render_tile(Config* cfg, int tile_x, int tile_y, int tile_w, int tile_h, int start_x, int start_y) {
+    double total_dx = (cfg->x_max - cfg->x_min) / cfg->width;
+    double total_dy = (cfg->y_max - cfg->y_min) / cfg->height;
+    
+    double tile_x_min = cfg->x_min + start_x * total_dx;
+    double tile_x_max = tile_x_min + tile_w * total_dx;
+    double tile_y_min = cfg->y_min + start_y * total_dy;
+    double tile_y_max = tile_y_min + tile_h * total_dy;
+    
+    uint8_t* tile_image = (uint8_t*)malloc(tile_w * tile_h * 3);
+    if (!tile_image) return -1.0;
+    
+    Config tile_cfg = *cfg;
+    tile_cfg.width = tile_w;
+    tile_cfg.height = tile_h;
+    tile_cfg.x_min = tile_x_min;
+    tile_cfg.x_max = tile_x_max;
+    tile_cfg.y_min = tile_y_min;
+    tile_cfg.y_max = tile_y_max;
+    tile_cfg.use_tiles = 0;  // Prevent recursion
+    
+    clock_t start = clock();
+    
+    if (cfg->use_gpu) {
+        if (!g_ctx.initialized) gpu_init();
+        double gpu_time = gpu_render(&tile_cfg, tile_image);
+        if (gpu_time < 0) {
+            free(tile_image);
+            return -1.0;
+        }
+    } else {
+        #pragma omp parallel for
+        for (int y = 0; y < tile_h; y++) {
+            double y0 = tile_cfg.y_min + y * total_dy;
+            for (int x = 0; x < tile_w; x++) {
+                double x0 = tile_cfg.x_min + x * total_dx;
+                int iter = mandelbrot_scalar(x0, y0, cfg->max_iter);
+                int idx = (y * tile_w + x) * 3;
+                uint8_t r, g, b;
+                get_color(iter, cfg->max_iter, cfg->grayscale, 
+                          cfg->gamma, cfg->brightness, &r, &g, &b);
+                tile_image[idx] = r;
+                tile_image[idx+1] = g;
+                tile_image[idx+2] = b;
+            }
+        }
+    }
+    
+    clock_t end = clock();
+    double time = (double)(end - start) / CLOCKS_PER_SEC;
+    
+    char tile_filename[512];
+    snprintf(tile_filename, sizeof(tile_filename), "%s/tile_%d_%d.png", cfg->tile_dir, tile_x, tile_y);
+    
+    FILE* fp = fopen(tile_filename, "wb");
+    if (fp) {
+        png_structp png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+        if (png_ptr) {
+            png_infop info_ptr = png_create_info_struct(png_ptr);
+            if (info_ptr && !setjmp(png_jmpbuf(png_ptr))) {
+                png_init_io(png_ptr, fp);
+                png_set_IHDR(png_ptr, info_ptr, tile_w, tile_h, 8, PNG_COLOR_TYPE_RGB,
+                             PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+                png_write_info(png_ptr, info_ptr);
+                
+                png_bytep row_pointers[tile_h];
+                for (int y = 0; y < tile_h; y++)
+                    row_pointers[y] = (png_bytep)(tile_image + y * tile_w * 3);
+                png_write_image(png_ptr, row_pointers);
+                png_write_end(png_ptr, NULL);
+            }
+            png_destroy_write_struct(&png_ptr, &info_ptr);
+        }
+        fclose(fp);
+    }
+    
+    free(tile_image);
+    return time;
+}
+
+static double render_tiled(Config* cfg, uint8_t* image) {
+    (void)image;
+    printf("\n=== TILE RENDERING MODE ===\n");
+    printf("Tile size: %dx%d pixels\n", cfg->tile_size, cfg->tile_size);
+    printf("Image size: %dx%d pixels\n", cfg->width, cfg->height);
+    
+    snprintf(cfg->tile_dir, sizeof(cfg->tile_dir), "tiles_%ld", time(NULL));
+    create_directory(cfg->tile_dir);
+    
+    int tiles_x = (cfg->width + cfg->tile_size - 1) / cfg->tile_size;
+    int tiles_y = (cfg->height + cfg->tile_size - 1) / cfg->tile_size;
+    int total_tiles = tiles_x * tiles_y;
+    
+    printf("Tiles: %dx%d = %d tiles\n", tiles_x, tiles_y, total_tiles);
+    
+    double start_time = clock();
+    int tile_count = 0;
+    
+    for (int ty = 0; ty < tiles_y; ty++) {
+        for (int tx = 0; tx < tiles_x; tx++) {
+            int start_x = tx * cfg->tile_size;
+            int start_y = ty * cfg->tile_size;
+            int tile_w = (start_x + cfg->tile_size > cfg->width) ? (cfg->width - start_x) : cfg->tile_size;
+            int tile_h = (start_y + cfg->tile_size > cfg->height) ? (cfg->height - start_y) : cfg->tile_size;
+            
+            printf("Rendering tile [%d,%d] (%dx%d)... ", tx, ty, tile_w, tile_h);
+            fflush(stdout);
+            
+            double tile_time = render_tile(cfg, tx, ty, tile_w, tile_h, start_x, start_y);
+            if (tile_time < 0) {
+                printf("FAILED\n");
+                return -1.0;
+            }
+            printf("done in %.2f sec\n", tile_time);
+            tile_count++;
+        }
+    }
+    
+    double total_time = (clock() - start_time) / CLOCKS_PER_SEC;
+    printf("\nAll %d tiles rendered in %.2f seconds\n", tile_count, total_time);
+    
+    // Stitch tiles together
+    stitch_with_imagemagick(cfg);
+    
+    return total_time;
+}
+
+static double gpu_render_tiled(Config* cfg, uint8_t* image) {
+    (void)image;
+    printf("\n=== GPU TILE RENDERING MODE ===\n");
+    printf("Tile size: %dx%d pixels\n", cfg->tile_size, cfg->tile_size);
+    printf("Image size: %dx%d pixels\n", cfg->width, cfg->height);
+    
+    if (!g_ctx.initialized && !gpu_init()) return -1.0;
+    gpu_print_info();
+    
+    snprintf(cfg->tile_dir, sizeof(cfg->tile_dir), "tiles_%ld", time(NULL));
+    create_directory(cfg->tile_dir);
+    
+    int tiles_x = (cfg->width + cfg->tile_size - 1) / cfg->tile_size;
+    int tiles_y = (cfg->height + cfg->tile_size - 1) / cfg->tile_size;
+    int total_tiles = tiles_x * tiles_y;
+    
+    printf("Tiles: %dx%d = %d tiles\n", tiles_x, tiles_y, total_tiles);
+    
+    double start_time = (double)clock();
+    double total_dx = (cfg->x_max - cfg->x_min) / cfg->width;
+    double total_dy = (cfg->y_max - cfg->y_min) / cfg->height;
+    int tile_count = 0;
+    
+    for (int ty = 0; ty < tiles_y; ty++) {
+        for (int tx = 0; tx < tiles_x; tx++) {
+            int start_x = tx * cfg->tile_size;
+            int start_y = ty * cfg->tile_size;
+            int tile_w = (start_x + cfg->tile_size > cfg->width) ? (cfg->width - start_x) : cfg->tile_size;
+            int tile_h = (start_y + cfg->tile_size > cfg->height) ? (cfg->height - start_y) : cfg->tile_size;
+            
+            double tile_x_min = cfg->x_min + start_x * total_dx;
+            double tile_x_max = tile_x_min + tile_w * total_dx;
+            double tile_y_min = cfg->y_min + start_y * total_dy;
+            double tile_y_max = tile_y_min + tile_h * total_dy;
+            
+            printf("Rendering tile [%d,%d] (%dx%d)... ", tx, ty, tile_w, tile_h);
+            fflush(stdout);
+            
+            Config tile_cfg = *cfg;
+            tile_cfg.width = tile_w;
+            tile_cfg.height = tile_h;
+            tile_cfg.x_min = tile_x_min;
+            tile_cfg.x_max = tile_x_max;
+            tile_cfg.y_min = tile_y_min;
+            tile_cfg.y_max = tile_y_max;
+            tile_cfg.use_tiles = 0;  // Prevent recursion
+            
+            uint8_t* tile_image = (uint8_t*)malloc(tile_w * tile_h * 3);
+            if (!tile_image) {
+                printf("Memory allocation failed\n");
+                return -1.0;
+            }
+            
+            size_t image_size = tile_w * tile_h * 3;
+            cl_int err;
+            cl_event event;
+            
+            g_ctx.buffer_output = clCreateBuffer(g_ctx.context, CL_MEM_WRITE_ONLY, image_size, NULL, &err);
+            if (err != CL_SUCCESS) {
+                printf("Failed to create buffer\n");
+                free(tile_image);
+                return -1.0;
+            }
+            
+            err = clSetKernelArg(g_ctx.kernel, 0, sizeof(cl_mem), &g_ctx.buffer_output);
+            
+            if (g_ctx.supports_double) {
+                double x_min = tile_cfg.x_min, x_max = tile_cfg.x_max, y_min = tile_cfg.y_min, y_max = tile_cfg.y_max;
+                err |= clSetKernelArg(g_ctx.kernel, 1, sizeof(double), &x_min);
+                err |= clSetKernelArg(g_ctx.kernel, 2, sizeof(double), &x_max);
+                err |= clSetKernelArg(g_ctx.kernel, 3, sizeof(double), &y_min);
+                err |= clSetKernelArg(g_ctx.kernel, 4, sizeof(double), &y_max);
+            } else {
+                float x_min = tile_cfg.x_min, x_max = tile_cfg.x_max, y_min = tile_cfg.y_min, y_max = tile_cfg.y_max;
+                err |= clSetKernelArg(g_ctx.kernel, 1, sizeof(float), &x_min);
+                err |= clSetKernelArg(g_ctx.kernel, 2, sizeof(float), &x_max);
+                err |= clSetKernelArg(g_ctx.kernel, 3, sizeof(float), &y_min);
+                err |= clSetKernelArg(g_ctx.kernel, 4, sizeof(float), &y_max);
+            }
+            
+            err |= clSetKernelArg(g_ctx.kernel, 5, sizeof(int), &tile_cfg.width);
+            err |= clSetKernelArg(g_ctx.kernel, 6, sizeof(int), &tile_cfg.height);
+            err |= clSetKernelArg(g_ctx.kernel, 7, sizeof(int), &tile_cfg.max_iter);
+            err |= clSetKernelArg(g_ctx.kernel, 8, sizeof(int), &tile_cfg.grayscale);
+            err |= clSetKernelArg(g_ctx.kernel, 9, sizeof(float), &tile_cfg.gamma);
+            err |= clSetKernelArg(g_ctx.kernel, 10, sizeof(float), &tile_cfg.brightness);
+            
+            if (err != CL_SUCCESS) {
+                printf("Failed to set kernel arguments\n");
+                clReleaseMemObject(g_ctx.buffer_output);
+                free(tile_image);
+                return -1.0;
+            }
+            
+            size_t global_work_size[2] = {tile_cfg.width, tile_cfg.height};
+            size_t local_work_size[2] = {16, 16};
+            if (global_work_size[0] % local_work_size[0] != 0) local_work_size[0] = 1;
+            if (global_work_size[1] % local_work_size[1] != 0) local_work_size[1] = 1;
+            
+            err = clEnqueueNDRangeKernel(g_ctx.queue, g_ctx.kernel, 2, NULL, global_work_size, local_work_size, 0, NULL, &event);
+            if (err != CL_SUCCESS) {
+                printf("Failed to execute kernel\n");
+                clReleaseMemObject(g_ctx.buffer_output);
+                free(tile_image);
+                return -1.0;
+            }
+            
+            clWaitForEvents(1, &event);
+            err = clEnqueueReadBuffer(g_ctx.queue, g_ctx.buffer_output, CL_TRUE, 0, image_size, tile_image, 0, NULL, NULL);
+            
+            cl_ulong start_gpu, end_gpu;
+            clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_START, sizeof(start_gpu), &start_gpu, NULL);
+            clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_END, sizeof(end_gpu), &end_gpu, NULL);
+            double tile_time = (end_gpu - start_gpu) * 1e-9;
+            
+            clReleaseEvent(event);
+            clReleaseMemObject(g_ctx.buffer_output);
+            g_ctx.buffer_output = 0;
+            
+            char tile_filename[512];
+            snprintf(tile_filename, sizeof(tile_filename), "%s/tile_%d_%d.png", cfg->tile_dir, tx, ty);
+            FILE* fp = fopen(tile_filename, "wb");
+            if (fp) {
+                png_structp png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+                if (png_ptr) {
+                    png_infop info_ptr = png_create_info_struct(png_ptr);
+                    if (info_ptr && !setjmp(png_jmpbuf(png_ptr))) {
+                        png_init_io(png_ptr, fp);
+                        png_set_IHDR(png_ptr, info_ptr, tile_w, tile_h, 8, PNG_COLOR_TYPE_RGB,
+                                     PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+                        png_write_info(png_ptr, info_ptr);
+                        png_bytep row_pointers[tile_h];
+                        for (int y = 0; y < tile_h; y++)
+                            row_pointers[y] = (png_bytep)(tile_image + y * tile_w * 3);
+                        png_write_image(png_ptr, row_pointers);
+                        png_write_end(png_ptr, NULL);
+                    }
+                    png_destroy_write_struct(&png_ptr, &info_ptr);
+                }
+                fclose(fp);
+            }
+            
+            free(tile_image);
+            tile_count++;
+            printf("done in %.2f sec\n", tile_time);
+        }
+    }
+    
+    double total_time = ((double)clock() - start_time) / CLOCKS_PER_SEC;
+    printf("\nAll %d tiles rendered in %.2f seconds\n", tile_count, total_time);
+    printf("Tiles saved to directory: %s\n", cfg->tile_dir);
+    
+    // Stitch tiles together
+    stitch_with_imagemagick(cfg);
+    
+    return total_time;
+}
+
+static double gpu_render(Config* cfg, uint8_t* image) {
+    size_t image_size = (size_t)cfg->width * cfg->height * 3;
+    
+    if (cfg->use_tiles) {
+        printf("Using tile rendering...\n");
+        return gpu_render_tiled(cfg, image);
+    }
+    
+    if (!g_ctx.initialized && !gpu_init()) return -1.0;
+    
+    cl_int err;
+    cl_event event;
+    double render_time = 0.0;
+    
+    g_ctx.buffer_output = clCreateBuffer(g_ctx.context, CL_MEM_WRITE_ONLY, image_size, NULL, &err);
+    if (err != CL_SUCCESS) { fprintf(stderr, "Failed to create buffer\n"); return -1.0; }
+    
+    err = clSetKernelArg(g_ctx.kernel, 0, sizeof(cl_mem), &g_ctx.buffer_output);
+    
+    if (g_ctx.supports_double) {
+        double x_min = cfg->x_min, x_max = cfg->x_max, y_min = cfg->y_min, y_max = cfg->y_max;
+        err |= clSetKernelArg(g_ctx.kernel, 1, sizeof(double), &x_min);
+        err |= clSetKernelArg(g_ctx.kernel, 2, sizeof(double), &x_max);
+        err |= clSetKernelArg(g_ctx.kernel, 3, sizeof(double), &y_min);
+        err |= clSetKernelArg(g_ctx.kernel, 4, sizeof(double), &y_max);
+    } else {
+        float x_min = cfg->x_min, x_max = cfg->x_max, y_min = cfg->y_min, y_max = cfg->y_max;
+        err |= clSetKernelArg(g_ctx.kernel, 1, sizeof(float), &x_min);
+        err |= clSetKernelArg(g_ctx.kernel, 2, sizeof(float), &x_max);
+        err |= clSetKernelArg(g_ctx.kernel, 3, sizeof(float), &y_min);
+        err |= clSetKernelArg(g_ctx.kernel, 4, sizeof(float), &y_max);
+    }
+    
+    err |= clSetKernelArg(g_ctx.kernel, 5, sizeof(int), &cfg->width);
+    err |= clSetKernelArg(g_ctx.kernel, 6, sizeof(int), &cfg->height);
+    err |= clSetKernelArg(g_ctx.kernel, 7, sizeof(int), &cfg->max_iter);
+    err |= clSetKernelArg(g_ctx.kernel, 8, sizeof(int), &cfg->grayscale);
+    err |= clSetKernelArg(g_ctx.kernel, 9, sizeof(float), &cfg->gamma);
+    err |= clSetKernelArg(g_ctx.kernel, 10, sizeof(float), &cfg->brightness);
+    
+    if (err != CL_SUCCESS) { fprintf(stderr, "Failed to set kernel arguments\n"); return -1.0; }
+    
+    size_t global_work_size[2] = {cfg->width, cfg->height};
+    size_t local_work_size[2] = {16, 16};
+    if (global_work_size[0] % local_work_size[0] != 0) local_work_size[0] = 1;
+    if (global_work_size[1] % local_work_size[1] != 0) local_work_size[1] = 1;
+    
+    err = clEnqueueNDRangeKernel(g_ctx.queue, g_ctx.kernel, 2, NULL, global_work_size, local_work_size, 0, NULL, &event);
+    if (err != CL_SUCCESS) { fprintf(stderr, "Failed to execute kernel\n"); return -1.0; }
+    
+    clWaitForEvents(1, &event);
+    err = clEnqueueReadBuffer(g_ctx.queue, g_ctx.buffer_output, CL_TRUE, 0, image_size, image, 0, NULL, NULL);
+    
+    cl_ulong start, end;
+    clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_START, sizeof(start), &start, NULL);
+    clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_END, sizeof(end), &end, NULL);
+    render_time = (end - start) * 1e-9;
+    
+    clReleaseEvent(event);
+    clReleaseMemObject(g_ctx.buffer_output);
+    g_ctx.buffer_output = 0;
+    
+    return render_time;
+}
+
+#else  // USE_OPENCL not defined
+
+static int gpu_init(void) { return 0; }
+static void gpu_cleanup(void) {}
+static double gpu_render(Config* cfg, uint8_t* image) {
+    (void)cfg; (void)image;
+    printf("GPU rendering not available. Compile with -DUSE_OPENCL\n");
+    return -1.0;
+}
+
+static double render_tiled(Config* cfg, uint8_t* image) {
+    (void)image;
+    printf("Tile rendering only available with CPU when not using OpenCL\n");
+    return -1.0;
+}
+
+static double gpu_render_tiled(Config* cfg, uint8_t* image) {
+    (void)cfg; (void)image;
+    printf("GPU tile rendering not available. Compile with -DUSE_OPENCL\n");
+    return -1.0;
+}
+
+#endif  // USE_OPENCL
+
+static int stitch_with_imagemagick(Config* cfg) {
+    printf("\n=== Stitching tiles with ImageMagick (low memory) ===\n");
+    
+    int check = system("magick --version > nul 2>&1");
+    if (check != 0) {
+        printf("Warning: ImageMagick not found!\n");
+        printf("Install with: pacman -S mingw-w64-x86_64-imagemagick\n");
+        printf("Or stitch manually using: magick montage ...\n");
+        return 0;
+    }
+    
+    int tiles_x = (cfg->width + cfg->tile_size - 1) / cfg->tile_size;
+    int tiles_y = (cfg->height + cfg->tile_size - 1) / cfg->tile_size;
+    
+    char batch_file[512];
+    snprintf(batch_file, sizeof(batch_file), "%s/stitch.bat", cfg->tile_dir);
+    
+    FILE* bat = fopen(batch_file, "w");
+    if (!bat) {
+        printf("Failed to create batch file\n");
+        return 0;
+    }
+    
+    fprintf(bat, "cd /d \"%s\"\n", cfg->tile_dir);
+    fprintf(bat, "magick montage");
+    
+    for (int ty = 0; ty < tiles_y; ty++) {
+        for (int tx = 0; tx < tiles_x; tx++) {
+            fprintf(bat, " tile_%d_%d.png", tx, ty);
+        }
+    }
+    
+    fprintf(bat, " -tile %dx%d -geometry +0+0 -background black \"%s\"\n", 
+            tiles_x, tiles_y, cfg->output_file);
+    
+    fclose(bat);
+    
+    printf("Stitching %d tiles (%dx%d grid)...\n", tiles_x * tiles_y, tiles_x, tiles_y);
+    printf("Running ImageMagick...\n");
+    fflush(stdout);
+    
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "call \"%s\"", batch_file);
+    int result = system(cmd);
+    
+    if (result == 0) {
+        printf("Final image saved to: %s\n", cfg->output_file);
+        return 1;
+    } else {
+        printf("ImageMagick stitching failed with code %d\n", result);
+        return 0;
+    }
+}
+
+/* ===========================================
+   Main Rendering Function (UPDATED with AVX-512)
+   =========================================== */
+
+static void render_mandelbrot(Config* cfg, uint8_t* image) {
+    clock_t total_start = clock();
+    
+    if (cfg->use_tiles) {
+        if (cfg->use_gpu) {
+            double tile_time = gpu_render_tiled(cfg, image);
+            if (tile_time > 0) {
+                printf("GPU Tiles: %.3f seconds\n", tile_time);
+                return;
+            }
+            printf("GPU tile rendering failed, falling back to CPU tiles\n");
+        }
+        double tile_time = render_tiled(cfg, image);
+        if (tile_time > 0) {
+            printf("CPU Tiles: %.3f seconds\n", tile_time);
+            return;
+        }
+        return;
+    }
+    
+    if (cfg->use_gpu) {
+        printf("\nGPU Rendering...\n");
+        double gpu_time = gpu_render(cfg, image);
+        if (gpu_time > 0) {
+            printf("GPU: %.3f seconds\n", gpu_time);
+            return;
+        }
+        printf("GPU failed, using CPU\n");
+        cfg->use_gpu = 0;
+    }
+    
+    printf("\nCPU Rendering...\n");
+    
+    // AVX-512 detection and usage
+    int use_avx512 = cfg->use_avx512 && (cfg->cpu_features & CPU_FEATURE_AVX512);
+    int use_avx2 = cfg->use_avx2 && (cfg->cpu_features & CPU_FEATURE_AVX2);
+    
+#ifdef __AVX512F__
+    if (use_avx512) {
+        printf("Using: AVX-512 + OpenMP\n");
+    } else
+#endif
+#ifdef __AVX2__
+    if (use_avx2) {
+        printf("Using: AVX2 + OpenMP\n");
+    } else
+#endif
+    {
+        printf("Using: Scalar + OpenMP\n");
+    }
+    
+    int num_threads = cfg->num_threads;
+    int actual_threads = num_threads ? num_threads : omp_get_max_threads();
+    printf("Threads: %d\n", actual_threads);
+    
+    clock_t cpu_start = clock();
+    double dx = (cfg->x_max - cfg->x_min) / cfg->width;
+    double dy = (cfg->y_max - cfg->y_min) / cfg->height;
+    
+    #pragma omp parallel for num_threads(num_threads > 0 ? num_threads : omp_get_max_threads())
+    for (int y = 0; y < cfg->height; y++) {
+        double y0 = cfg->y_min + y * dy;
+        int x = 0;
+        
+#ifdef __AVX512F__
+        if (use_avx512) {
+            // Process 8 pixels at a time with AVX-512
+            for (; x <= cfg->width - 8; x += 8) {
+                double x_coords[8] __attribute__((aligned(64)));
+                for (int k = 0; k < 8; k++)
+                    x_coords[k] = cfg->x_min + (x + k) * dx;
+                
+                __m512d x0_vec = _mm512_load_pd(x_coords);
+                __m512d y0_vec = _mm512_set1_pd(y0);
+                int results[8];
+                mandelbrot_avx512(x0_vec, y0_vec, cfg->max_iter, results);
+                
+                for (int k = 0; k < 8; k++) {
+                    int idx = (y * cfg->width + (x + k)) * 3;
+                    uint8_t r, g, b;
+                    get_color(results[k], cfg->max_iter, cfg->grayscale, 
+                              cfg->gamma, cfg->brightness, &r, &g, &b);
+                    image[idx] = r; image[idx+1] = g; image[idx+2] = b;
+                }
+            }
+        }
+#endif
+        
+#ifdef __AVX2__
+        if (use_avx2 && !use_avx512) {
+            // Process 4 pixels at a time with AVX2
+            for (; x <= cfg->width - 4; x += 4) {
+                double x_coords[4] __attribute__((aligned(32)));
+                for (int k = 0; k < 4; k++)
+                    x_coords[k] = cfg->x_min + (x + k) * dx;
+                
+                __m256d x0_vec = _mm256_load_pd(x_coords);
+                __m256d y0_vec = _mm256_set1_pd(y0);
+                int results[4];
+                mandelbrot_avx2(x0_vec, y0_vec, cfg->max_iter, results);
+                
+                for (int k = 0; k < 4; k++) {
+                    int idx = (y * cfg->width + (x + k)) * 3;
+                    uint8_t r, g, b;
+                    get_color(results[k], cfg->max_iter, cfg->grayscale, 
+                              cfg->gamma, cfg->brightness, &r, &g, &b);
+                    image[idx] = r; image[idx+1] = g; image[idx+2] = b;
+                }
+            }
+        }
+#endif
+        
+        // Scalar fallback for remaining pixels
+        for (; x < cfg->width; x++) {
+            double x0 = cfg->x_min + x * dx;
+            int iter = mandelbrot_scalar(x0, y0, cfg->max_iter);
+            int idx = (y * cfg->width + x) * 3;
+            uint8_t r, g, b;
+            get_color(iter, cfg->max_iter, cfg->grayscale, 
+                      cfg->gamma, cfg->brightness, &r, &g, &b);
+            image[idx] = r; image[idx+1] = g; image[idx+2] = b;
+        }
+    }
+    
+    clock_t cpu_end = clock();
+    double cpu_time = (double)(cpu_end - cpu_start) / CLOCKS_PER_SEC;
+    double total_time = (double)(clock() - total_start) / CLOCKS_PER_SEC;
+    
+    printf("\nCPU (%d threads, %s): %.3f seconds\n", 
+           actual_threads, 
+#ifdef __AVX512F__
+           use_avx512 ? "AVX-512" :
+#endif
+#ifdef __AVX2__
+           use_avx2 ? "AVX2" :
+#endif
+           "Scalar", 
+           cpu_time);
+    printf("Performance: %.1f MPixels/second\n", (cfg->width * cfg->height) / (cpu_time * 1000000.0));
+    printf("Total: %.3f seconds\n", total_time);
+}
+
+/* ===========================================
+   PNG & PPM File I/O
+   =========================================== */
+
+static int save_png(const char* filename, uint8_t* image, int width, int height) {
+    FILE *fp = fopen(filename, "wb");
+    if (!fp) { perror("Failed to open file"); return 0; }
+    
+    png_structp png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png_ptr) { fclose(fp); return 0; }
+    
+    png_infop info_ptr = png_create_info_struct(png_ptr);
+    if (!info_ptr) { png_destroy_write_struct(&png_ptr, NULL); fclose(fp); return 0; }
+    
+    if (setjmp(png_jmpbuf(png_ptr))) {
+        png_destroy_write_struct(&png_ptr, &info_ptr);
+        fclose(fp);
+        return 0;
+    }
+    
+    png_init_io(png_ptr, fp);
+    png_set_IHDR(png_ptr, info_ptr, width, height, 8, PNG_COLOR_TYPE_RGB,
+                 PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_write_info(png_ptr, info_ptr);
+    
+    png_bytep row_pointers[height];
+    for (int y = 0; y < height; y++)
+        row_pointers[y] = (png_bytep)(image + y * width * 3);
+    
+    png_write_image(png_ptr, row_pointers);
+    png_write_end(png_ptr, NULL);
+    png_destroy_write_struct(&png_ptr, &info_ptr);
+    fclose(fp);
+    return 1;
+}
+
+static int save_ppm(const char* filename, uint8_t* image, int width, int height) {
+    FILE* fp = fopen(filename, "wb");
+    if (!fp) { perror("Failed to open file"); return 0; }
+    
+    fprintf(fp, "P6\n%d %d\n255\n", width, height);
+    size_t written = fwrite(image, 1, width * height * 3, fp);
+    fclose(fp);
+    return written == width * height * 3;
+}
+
+/* ===========================================
+   Command Line Parsing (UPDATED)
+   =========================================== */
+
+static void print_help(void) {
+    printf("Ultimate Mandelbrot Renderer\n");
+    printf("Usage: mandelbrot [options]\n\n");
+    printf("Options:\n");
+    printf("  -w, --width WIDTH     Image width (default: 1920)\n");
+    printf("  -h, --height HEIGHT   Image height (default: 1080)\n");
+    printf("  -i, --iter ITER       Max iterations (default: 1000)\n");
+    printf("  -x, --xmin X          Left bound (default: -2.5)\n");
+    printf("  -X, --xmax X          Right bound (default: 1.5)\n");
+    printf("  -y, --ymin Y          Bottom bound (default: -1.5)\n");
+    printf("  -Y, --ymax Y          Top bound (default: 1.5)\n");
+    printf("  -g, --grayscale       Output grayscale image\n");
+    printf("  -o, --output FILE     Output file (default: mandelbrot.ppm)\n");
+    printf("  -t, --threads N       Number of threads (0=auto)\n");
+    printf("  --avx512              Enable AVX-512 (if supported)\n");
+    printf("  --no-avx2             Disable AVX2\n");
+    printf("  --gpu                 Use GPU acceleration\n");
+    printf("  --benchmark           Run performance benchmark\n");
+    printf("  --gamma VALUE         Gamma correction (default: 0.3)\n");
+    printf("  --brightness VALUE    Brightness multiplier (default: 1.0)\n");
+    printf("  --tile-size SIZE      Tile size for large renders (default: 1080)\n");
+    printf("  --help                Show this help\n\n");
+    printf("Examples:\n");
+    printf("  mandelbrot -w 1920 -h 1080 -i 5000 -o output.png\n");
+    printf("  mandelbrot --gpu -x -0.745428 -X -0.745427 -y 0.113009 -Y 0.113010 -i 50000\n");
+    printf("  mandelbrot --avx512 -w 40000 -h 20000 --tile-size 3840 -o huge.png\n");
+}
+
+static void parse_args(int argc, char** argv, Config* cfg) {
+    cfg->width = 1920;
+    cfg->height = 1080;
+    cfg->max_iter = 1000;
+    cfg->x_min = -2.5;
+    cfg->x_max = 1.5;
+    cfg->y_min = -1.5;
+    cfg->y_max = 1.5;
+    cfg->use_gpu = 0;
+    cfg->use_avx2 = 1;
+    cfg->use_avx512 = 0;  // Default OFF
+    cfg->use_sse4 = 1;
+    cfg->num_threads = 0;
+    cfg->grayscale = 0;
+    cfg->benchmark = 0;
+    cfg->output_file = "mandelbrot.ppm";
+    cfg->cpu_features = detect_cpu_features();
+    cfg->gamma = 0.3f;
+    cfg->brightness = 1.0f;
+    
+    cfg->use_tiles = 0;
+    cfg->tile_size = 1080;
+    strcpy(cfg->tile_dir, "tiles");
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0) { print_help(); exit(0); }
+        else if (strcmp(argv[i], "--width") == 0 || strcmp(argv[i], "-w") == 0) { if (++i < argc) cfg->width = atoi(argv[i]); }
+        else if (strcmp(argv[i], "--height") == 0 || strcmp(argv[i], "-h") == 0) { if (++i < argc) cfg->height = atoi(argv[i]); }
+        else if (strcmp(argv[i], "--iter") == 0 || strcmp(argv[i], "-i") == 0) { if (++i < argc) cfg->max_iter = atoi(argv[i]); }
+        else if (strcmp(argv[i], "--xmin") == 0 || strcmp(argv[i], "-x") == 0) { if (++i < argc) cfg->x_min = atof(argv[i]); }
+        else if (strcmp(argv[i], "--xmax") == 0 || strcmp(argv[i], "-X") == 0) { if (++i < argc) cfg->x_max = atof(argv[i]); }
+        else if (strcmp(argv[i], "--ymin") == 0 || strcmp(argv[i], "-y") == 0) { if (++i < argc) cfg->y_min = atof(argv[i]); }
+        else if (strcmp(argv[i], "--ymax") == 0 || strcmp(argv[i], "-Y") == 0) { if (++i < argc) cfg->y_max = atof(argv[i]); }
+        else if (strcmp(argv[i], "--grayscale") == 0 || strcmp(argv[i], "-g") == 0) { cfg->grayscale = 1; }
+        else if (strcmp(argv[i], "--output") == 0 || strcmp(argv[i], "-o") == 0) { if (++i < argc) cfg->output_file = argv[i]; }
+        else if (strcmp(argv[i], "--threads") == 0 || strcmp(argv[i], "-t") == 0) { if (++i < argc) cfg->num_threads = atoi(argv[i]); }
+        else if (strcmp(argv[i], "--avx512") == 0) { 
+            cfg->use_avx512 = 1; 
+            cfg->use_avx2 = 0;  // AVX-512 supersedes AVX2
+        }
+        else if (strcmp(argv[i], "--no-avx2") == 0) { cfg->use_avx2 = 0; }
+        else if (strcmp(argv[i], "--gpu") == 0) { cfg->use_gpu = 1; }
+        else if (strcmp(argv[i], "--benchmark") == 0) { cfg->benchmark = 1; }
+        else if (strcmp(argv[i], "--gamma") == 0) { if (++i < argc) cfg->gamma = atof(argv[i]); }
+        else if (strcmp(argv[i], "--brightness") == 0) { if (++i < argc) cfg->brightness = atof(argv[i]); }
+        else if (strcmp(argv[i], "--tile-size") == 0 && i + 1 < argc) { 
+            i++; 
+            cfg->tile_size = atoi(argv[i]);
+            cfg->use_tiles = 1;
+        }
+    }
+    
+    if ((long long)cfg->width * cfg->height > 100000000) {
+        cfg->use_tiles = 1;
+        printf("Auto-enabling tile mode for large image (%dx%d = %lld MP)\n", 
+               cfg->width, cfg->height, (long long)cfg->width * cfg->height / 1000000);
+    }
+}
+
+/* ===========================================
+   Benchmark Function
+   =========================================== */
+
+static void run_benchmark(Config* cfg) {
+    printf("\n=== Performance Benchmark ===\n");
+    int test_iterations[] = {256, 1000, 4000, 16000, 32000};
+    int num_tests = sizeof(test_iterations) / sizeof(test_iterations[0]);
+    
+    int orig_width = cfg->width, orig_height = cfg->height;
+    cfg->width = 640; cfg->height = 480;
+    uint8_t* test_image = malloc(cfg->width * cfg->height * 3);
+    if (!test_image) { printf("Memory allocation failed\n"); return; }
+    
+    for (int i = 0; i < num_tests; i++) {
+        cfg->max_iter = test_iterations[i];
+        clock_t start = clock();
+        render_mandelbrot(cfg, test_image);
+        clock_t end = clock();
+        double time = (double)(end - start) / CLOCKS_PER_SEC;
+        printf("  %5d iterations: %.3f seconds\n", test_iterations[i], time);
+    }
+    
+    cfg->width = orig_width; cfg->height = orig_height;
+    free(test_image);
+}
+
+/* ===========================================
+   Main Function
+   =========================================== */
+
+int main(int argc, char** argv) {
+    Config cfg;
+    parse_args(argc, argv, &cfg);
+    
+    printf("=== Ultimate Mandelbrot Renderer ===\n");
+    printf("Resolution: %dx%d\n", cfg.width, cfg.height);
+    printf("Iterations: %d\n", cfg.max_iter);
+    printf("Viewport: [%.6f, %.6f] x [%.6f, %.6f]\n", cfg.x_min, cfg.x_max, cfg.y_min, cfg.y_max);
+    printf("Mode: %s\n", cfg.use_gpu ? "GPU" : "CPU");
+    if (cfg.use_avx512) printf("AVX-512: ENABLED\n");
+    if (cfg.use_tiles) {
+        printf("Tile mode: enabled (tile size: %dx%d)\n", cfg.tile_size, cfg.tile_size);
+    }
+    printf("Color: %s\n", cfg.grayscale ? "Grayscale" : "RGB");
+    printf("Gamma: %.2f, Brightness: %.2f\n", cfg.gamma, cfg.brightness);
+    printf("CPU Features: ");
+    if (cfg.cpu_features & CPU_FEATURE_AVX512) printf("AVX-512 ");
+    if (cfg.cpu_features & CPU_FEATURE_AVX2) printf("AVX2 ");
+    if (cfg.cpu_features & CPU_FEATURE_SSE4_2) printf("SSE4.2 ");
+    if (cfg.cpu_features & CPU_FEATURE_SSE4_1) printf("SSE4.1 ");
+    if (cfg.cpu_features & CPU_FEATURE_SSE3) printf("SSE3 ");
+    if (cfg.cpu_features == CPU_FEATURE_NONE) printf("Scalar only");
+    printf("\n");
+    
+    if (cfg.benchmark) run_benchmark(&cfg);
+    
+    uint8_t* image = NULL;
+    
+    if (!cfg.use_tiles) {
+        printf("Allocating image buffer...\n");
+        image = malloc(cfg.width * cfg.height * 3);
+        if (!image) {
+            fprintf(stderr, "Failed to allocate memory\n");
+            return 1;
+        }
+    } else {
+        printf("Using tile rendering (tiles will be stitched automatically)\n");
+    }
+    
+    printf("Starting render...\n");
+    render_mandelbrot(&cfg, image);
+    
+    if (image) {
+        const char* ext = strrchr(cfg.output_file, '.');
+        int success = 0;
+        if (ext && (strcmp(ext, ".png") == 0 || strcmp(ext, ".PNG") == 0))
+            success = save_png(cfg.output_file, image, cfg.width, cfg.height);
+        else
+            success = save_ppm(cfg.output_file, image, cfg.width, cfg.height);
+        
+        if (success) printf("Image saved to: %s\n", cfg.output_file);
+        else fprintf(stderr, "Failed to save image\n");
+        
+        free(image);
+    }
+    
+#ifdef USE_OPENCL
+    gpu_cleanup();
+#endif
+    
+    printf("\nDone!\n");
+    return 0;
+}
